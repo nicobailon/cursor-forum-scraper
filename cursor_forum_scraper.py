@@ -11,6 +11,9 @@ from dotenv import load_dotenv
 from firecrawl import FirecrawlApp
 from bs4 import BeautifulSoup
 from requests.exceptions import RequestException
+import argparse
+from tqdm import tqdm
+import time
 
 # Configure logging
 logging.basicConfig(
@@ -35,50 +38,32 @@ if not FIRECRAWL_API_KEY:
 app = FirecrawlApp(api_key=FIRECRAWL_API_KEY)
 
 class ForumCrawler:
-    def __init__(self, base_url: str = "https://forum.cursor.com", rate_limit_delay: float = 1.0):
+    def __init__(self, base_url: str, rate_limit_delay: float):
         """Initialize the ForumCrawler with base URL and rate limiting configuration.
         
         Args:
             base_url (str): The base URL of the forum to crawl.
-            rate_limit_delay (float): Delay between requests in seconds.
+            rate_limit_delay (float): Minimum delay between requests in seconds.
         """
         self.base_url = base_url
         self.latest_posts_url = urljoin(self.base_url, "/latest")
         self.rate_limit_delay = rate_limit_delay
 
     def extract_post_id(self, url: str) -> Optional[str]:
-        """Extract the post ID from a forum post URL.
-        
-        Args:
-            url (str): The URL of the forum post.
-            
-        Returns:
-            Optional[str]: The post ID if found, None otherwise.
-        """
+        """Extract the post ID from a forum post URL."""
         match = re.search(r'/t/[^/]+/(\d+)', url)
         return match.group(1) if match else None
 
     def parse_post_html(self, html_content: str, post_url: str) -> Dict:
-        """Parse HTML content of a forum post to extract structured data.
-        
-        Args:
-            html_content (str): The HTML content of the post page.
-            post_url (str): The URL of the post being parsed.
-        
-        Returns:
-            Dict: A dictionary containing post details (title, author, date, etc.).
-        """
+        """Parse HTML content of a forum post to extract structured data."""
         soup = BeautifulSoup(html_content, 'html.parser')
 
-        # Extract title
         title_elem = soup.select_one('h1.topic-title')
         title = title_elem.text.strip() if title_elem else "Unknown"
 
-        # Extract author
         author_elem = soup.select_one('.topic-meta-data .names .username')
         author = author_elem.text.strip() if author_elem else "Unknown"
 
-        # Extract date
         date_elem = soup.select_one('.topic-meta-data .post-date')
         date = "Unknown"
         if date_elem:
@@ -88,15 +73,12 @@ class ForumCrawler:
             except Exception as e:
                 logger.warning(f"Failed to parse date for post {post_url}: {e}")
 
-        # Extract content
         content_elem = soup.select_one('.topic-body .cooked')
         content = content_elem.text.strip() if content_elem else ""
 
-        # Extract tags
         tags_elems = soup.select('.discourse-tags .discourse-tag')
         tags = [tag.text.strip() for tag in tags_elems] if tags_elems else []
 
-        # Extract replies
         replies_data = []
         replies_elems = soup.select('.topic-post:not(.topic-owner)')
         for reply in replies_elems:
@@ -133,11 +115,7 @@ class ForumCrawler:
         }
 
     def get_post_links(self) -> List[str]:
-        """Retrieve unique links to forum posts from the latest posts page.
-        
-        Returns:
-            List[str]: A list of unique post URLs.
-        """
+        """Retrieve unique links to forum posts from the latest posts page."""
         logger.info(f"Crawling latest posts page: {self.latest_posts_url}")
         params = {
             "crawlerOptions": {
@@ -160,60 +138,44 @@ class ForumCrawler:
         logger.info(f"Found {len(unique_post_links)} unique post links")
         return unique_post_links
 
-    def scrape_post(self, url: str) -> Optional[Dict]:
-        """Scrape and parse a single forum post.
-        
-        Args:
-            url (str): The URL of the post to scrape.
-            
-        Returns:
-            Optional[Dict]: A dictionary containing the post data if successful, None otherwise.
-        """
-        logger.info(f"Scraping post URL: {url}")
-        
-        params = {"formats": ["html", "markdown"], "includeMetadata": True}
-        
-        try:
-            result = app.scrape_url(url=url, params=params)
-            
-            html_content = result.get("html")
-            
-            if not html_content:
-                logger.error(f"No HTML content found for {url}")
-                return None
-            
-            parsed_data = self.parse_post_html(html_content, url)
-            
-            # Add markdown content and metadata
-            parsed_data["markdown_content"] = result.get("markdown", "")
-            parsed_data["metadata"] = result.get("metadata", {})
-            
-            logger.info(f"Successfully scraped post: {parsed_data['title']} ({url})")
-            return parsed_data
-        
-        except RequestException as e:
-            logger.error(f"Request error scraping {url}: {e}")
-            return None
-        
-    def crawl_forum(self, output_file: str):
-        """Crawl the forum to extract posts and save the data.
-        
-        Args:
-            output_file (str): Path to the output JSON file.
-            
-        Returns:
-            Dict: The final output data.
-        """
+    def scrape_post(self, url: str, retries: int = 3) -> Optional[Dict]:
+        """Scrape and parse a single forum post with retry logic."""
+        for attempt in range(retries):
+            try:
+                result = app.scrape_url(url=url, params={"formats": ["html", "markdown"], "includeMetadata": True})
+                html_content = result.get("html")
+                if not html_content:
+                    logger.error(f"No HTML content found for {url}")
+                    return None
+                parsed_data = self.parse_post_html(html_content, url)
+                parsed_data["markdown_content"] = result.get("markdown", "")
+                parsed_data["metadata"] = result.get("metadata", {})
+                logger.info(f"Successfully scraped post: {parsed_data['title']} ({url})")
+                return parsed_data
+            except RequestException as e:
+                logger.warning(f"Attempt {attempt + 1} failed for {url}: {e}")
+                if attempt < retries - 1:
+                    sleep(2 ** attempt)  # Exponential backoff
+                else:
+                    logger.error(f"Failed to scrape {url} after {retries} attempts")
+                    return None
+
+    def crawl_forum(self, output_file: str, max_posts: Optional[int] = None):
+        """Crawl the forum to extract posts and save the data."""
         posts_urls = self.get_post_links()
+        if max_posts:
+            posts_urls = posts_urls[:max_posts]
         posts_data_list = []
-        
-        for idx, post_url in enumerate(posts_urls):
+
+        for post_url in tqdm(posts_urls, desc="Scraping posts"):
+            start_time = time.time()
             scraped_data = self.scrape_post(post_url)
             if scraped_data:
                 posts_data_list.append(scraped_data)
-                logger.info(f"Processed {idx + 1}/{len(posts_urls)} posts")
-                sleep(self.rate_limit_delay)
-        
+            elapsed = time.time() - start_time
+            if elapsed < self.rate_limit_delay:
+                sleep(self.rate_limit_delay - elapsed)
+
         final_output_json = {
             "forum_name": "Cursor Forum",
             "source_url": self.latest_posts_url,
@@ -221,7 +183,7 @@ class ForumCrawler:
             "posts_count": len(posts_data_list),
             "posts": posts_data_list
         }
-        
+
         try:
             with open(output_file, 'w', encoding='utf-8') as json_file:
                 json.dump(final_output_json, json_file, indent=2, ensure_ascii=False)
@@ -229,13 +191,18 @@ class ForumCrawler:
         except IOError as e:
             logger.error(f"Failed to write to {output_file}: {e}")
             raise
-        
-        return final_output_json
 
 def main():
+    parser = argparse.ArgumentParser(description="Crawl Cursor Forum posts")
+    parser.add_argument("--base-url", default="https://forum.cursor.com", help="Base URL of the forum")
+    parser.add_argument("--output-file", default="cursor_forum_latest_posts.json", help="Output JSON file")
+    parser.add_argument("--rate-limit-delay", type=float, default=1.0, help="Minimum delay between requests in seconds")
+    parser.add_argument("--max-posts", type=int, default=None, help="Maximum number of posts to scrape")
+    args = parser.parse_args()
+
     try:
-        crawler_instance = ForumCrawler(rate_limit_delay=1.0)
-        crawler_instance.crawl_forum("cursor_forum_latest_posts.json")
+        crawler_instance = ForumCrawler(base_url=args.base_url, rate_limit_delay=args.rate_limit_delay)
+        crawler_instance.crawl_forum(output_file=args.output_file, max_posts=args.max_posts)
     except Exception as e:
         logger.error(f"Crawling failed: {e}")
         raise
