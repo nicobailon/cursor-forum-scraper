@@ -1,0 +1,27 @@
+# Environment configuration
+.env
+
+# Generated files
+crawl_forum.log
+cursor_forum_latest_posts.json
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
